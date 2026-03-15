@@ -65,6 +65,7 @@ save_adapter_separately = true
 batch_size = 256
 rollouts_per_example = 8
 oversampling_factor = 1.5
+use_token_client = false
 
 [orchestrator.model.lora]
 name = "ministral-3-agent-diff"
