@@ -337,13 +337,14 @@ def train(config: TrainerConfig):
                 # we could've gotten routed experts from the inference server, but we didn't enable router replay
                 routed_experts = None
 
-            # Multimodal fields (Qwen3-VL) - only present for VLM training
+            # Multimodal fields - only present for VLM training
             pixel_values = (
                 micro_batch["pixel_values"].to("cuda") if micro_batch.get("pixel_values") is not None else None
             )
             image_grid_thw = (
                 micro_batch["image_grid_thw"].to("cuda") if micro_batch.get("image_grid_thw") is not None else None
             )
+            image_sizes = micro_batch["image_sizes"].to("cuda") if micro_batch.get("image_sizes") is not None else None
 
             labels = shift_tensor_left(input_ids)
 
@@ -388,6 +389,7 @@ def train(config: TrainerConfig):
                     temperature=temperatures,
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
+                    image_sizes=image_sizes,
                     routed_experts=routed_experts,
                 )
 

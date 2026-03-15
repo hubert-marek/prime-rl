@@ -123,6 +123,7 @@ MODEL_TOOL_CALL_PARSER: dict[str, str] = {
 def resolve_tool_call_parser(model_name: str, tool_call_parser: str | None) -> str | None:
     """Resolve tool_call_parser from model name if set to "auto"."""
     if tool_call_parser == "auto":
+        # Keep unsupported or unvalidated families unresolved rather than guessing.
         return MODEL_TOOL_CALL_PARSER.get(model_name)
     return tool_call_parser
 

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+import torch
 import verifiers as vf
 from PIL import Image
 
@@ -1109,6 +1110,53 @@ def test_interleave_rollout_uses_cache_key_override():
     assert rollouts[0].image_grid_thw == [[1, 2, 3]]
 
 
+def test_interleave_rollout_with_image_sizes_cache():
+    arr = np.zeros((1, 3, 14, 14), dtype=np.float32)
+    cache = VLMImageCache(
+        {1: [(arr.tobytes(), list(arr.shape), [[14, 14]])]},
+        num_unique_examples=1,
+        extract_time=0.0,
+        preprocess_time=0.0,
+        metadata_kind="image_sizes",
+    )
+
+    output = vf.RolloutOutput(
+        example_id=1,
+        trajectory=[
+            vf.TrajectoryStep(
+                prompt=[{"role": "user", "content": "Describe"}],
+                completion=[{"role": "assistant", "content": "A cat"}],
+                response=MagicMock(),
+                tokens=vf.TrajectoryStepTokens(
+                    prompt_ids=[1, 2],
+                    prompt_mask=[0, 0],
+                    completion_ids=[3, 4],
+                    completion_mask=[1, 1],
+                    completion_logprobs=[-0.1, -0.2],
+                    overlong_prompt=False,
+                    is_truncated=False,
+                ),
+                reward=None,
+                advantage=None,
+                is_truncated=False,
+                trajectory_id="1",
+                extras={},
+            )
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output, vlm_cache=cache)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.image_sizes == [[14, 14]]
+    assert rollout.image_grid_thw is None
+    assert rollout.pixel_values_shape == [1, 3, 14, 14]
+
+
 def test_interleave_rollout_vlm_image_then_text_turns():
     """
     VLM 3-step trajectory: image in step 0, text-only in steps 1 and 2.
@@ -2019,9 +2067,9 @@ def test_image_store_assemble():
 
     store = _ImageStore(
         image_bytes=[img0, img1],
-        image_num_patches=[3, 2],
-        patch_dim=patch_dim,
-        image_grids=[[1, 1, 3], [1, 1, 2]],
+        image_shapes=[[3, patch_dim], [2, patch_dim]],
+        metadata_kind="image_grid_thw",
+        image_metadata=[[1, 1, 3], [1, 1, 2]],
     )
 
     # Assemble both images
@@ -2051,9 +2099,9 @@ def test_vlm_image_cache_from_store():
 
     store = _ImageStore(
         image_bytes=[img0_data.tobytes(), img1_data.tobytes()],
-        image_num_patches=[1, 1],
-        patch_dim=patch_dim,
-        image_grids=[[1, 2, 3], [1, 4, 4]],
+        image_shapes=[[1, patch_dim], [1, patch_dim]],
+        metadata_kind="image_grid_thw",
+        image_metadata=[[1, 2, 3], [1, 4, 4]],
     )
 
     step_indices = {
@@ -2156,3 +2204,45 @@ def test_build_vlm_image_cache_uses_store():
     assert pv is not None
     assert shape == [1, 1]
     assert grid == [[1, 1, 1]]
+
+
+def test_build_vlm_image_cache_with_image_sizes_uses_store():
+    red_url = _create_test_image("red")
+
+    output = vf.RolloutOutput(
+        example_id=1,
+        trajectory=[
+            vf.TrajectoryStep(
+                prompt=[_create_image_message(red_url, "What color?")],
+                completion=[{"role": "assistant", "content": "Red"}],
+                response=MagicMock(),
+                tokens=MagicMock(),
+                reward=None,
+                advantage=None,
+                is_truncated=False,
+                trajectory_id="1",
+                extras={},
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    mock_processor = MagicMock()
+    mock_processor.image_processor = MagicMock(
+        side_effect=lambda images, return_tensors: {
+            "pixel_values": torch.zeros((len(images), 3, 14, 14), dtype=torch.float32),
+            "image_sizes": torch.tensor([[14, 14]] * len(images)),
+        }
+    )
+
+    cache = build_vlm_image_cache([output], mock_processor)
+
+    assert cache._store is not None
+    assert cache._step_indices is not None
+    assert cache.metadata_kind == "image_sizes"
+
+    pv, shape, metadata = cache.get_for_step(0, 0)
+    assert pv is not None
+    assert shape == [1, 3, 14, 14]
+    assert metadata == [[14, 14]]

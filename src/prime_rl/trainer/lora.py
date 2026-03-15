@@ -86,6 +86,12 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
     return target_modules
 
 
+def _module_is_frozen(module: nn.Module) -> bool:
+    """Return True when a module has parameters and all of them are frozen."""
+    params = list(module.parameters())
+    return len(params) > 0 and all(not param.requires_grad for param in params)
+
+
 def _should_keep_trainable(param_name: str, modules_to_save_patterns: List[str]) -> bool:
     """Check if a parameter should remain fully trainable.
 
@@ -159,6 +165,10 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
 
     for module_name in target_modules:
         base_module = _get_module_by_name(model, module_name)
+
+        if _module_is_frozen(base_module):
+            logger.debug(f"Skipping frozen module {module_name} during LoRA application")
+            continue
 
         # Handle Linear layers
         if isinstance(base_module, nn.Linear):

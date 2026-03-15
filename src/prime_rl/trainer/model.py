@@ -118,29 +118,40 @@ torch._dynamo.config.recompile_limit = 16  # default: 8
 torch._dynamo.config.cache_size_limit = 64  # default: 8
 
 
+def _get_vlm_auxiliary_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """Return frozen multimodal modules that should be treated as auxiliary to the LM."""
+    candidates = [
+        ("model.visual", getattr(getattr(model, "model", None), "visual", None)),
+        ("visual", getattr(model, "visual", None)),
+        ("model.vision_tower", getattr(getattr(model, "model", None), "vision_tower", None)),
+        ("vision_tower", getattr(model, "vision_tower", None)),
+        ("model.multi_modal_projector", getattr(getattr(model, "model", None), "multi_modal_projector", None)),
+        ("multi_modal_projector", getattr(model, "multi_modal_projector", None)),
+    ]
+
+    seen: set[int] = set()
+    modules: list[tuple[str, nn.Module]] = []
+    for name, module in candidates:
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        modules.append((name, module))
+    return modules
+
+
 def freeze_vision_encoder(model: nn.Module) -> None:
-    """Freeze the vision encoder parameters for VLM training.
-
-    For Qwen3-VL, the vision encoder is at model.model.visual.
-    This freezes all parameters in the vision encoder so only the
-    language model (with LoRA) is trained.
-    """
+    """Freeze multimodal modules so only the language model remains trainable."""
     logger = get_logger()
-
-    # Qwen3-VL structure: model.model.visual
-    if hasattr(model, "model") and hasattr(model.model, "visual"):
-        vision_encoder = model.model.visual
-    # Qwen2-VL structure: model.visual
-    elif hasattr(model, "visual"):
-        vision_encoder = model.visual
-    else:
-        raise ValueError("Could not find vision encoder to freeze. Expected model.model.visual or model.visual")
+    vlm_modules = _get_vlm_auxiliary_modules(model)
+    if not vlm_modules:
+        raise ValueError("Could not find vision modules to freeze for the VLM model")
 
     num_frozen = 0
-    for param in vision_encoder.parameters():
-        param.requires_grad = False
-        num_frozen += 1
-    logger.info(f"Froze {num_frozen} parameters in vision encoder")
+    for _, module in vlm_modules:
+        for param in module.parameters():
+            param.requires_grad = False
+            num_frozen += 1
+    logger.info(f"Froze {num_frozen} parameters in VLM auxiliary modules: {[name for name, _ in vlm_modules]}")
 
 
 def freeze_moe_router(model: nn.Module) -> None:
@@ -181,8 +192,10 @@ def get_language_model(model: nn.Module) -> nn.Module:
     For VLM models (Qwen3-VL): model.model.language_model
     For text-only models: model.model
     """
-    if hasattr(model.model, "language_model"):
+    if hasattr(model, "model") and hasattr(model.model, "language_model"):
         return model.model.language_model
+    if hasattr(model, "language_model"):
+        return model.language_model
     return model.model
 
 
@@ -365,23 +378,20 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
 
         dp_mod_ep_mesh = parallel_dims.world_mesh[tuple(dp_mod_ep_mesh_dim_names)]
 
-    # For VLM models, shard the frozen vision encoder as a single unit
-    # This allows FSDP to manage the memory while keeping it frozen
-    is_vlm = is_vlm_model(config.name) or (hasattr(model, "model") and hasattr(model.model, "visual"))
+    # For VLM models, shard the frozen auxiliary modules as standalone units.
+    is_vlm = is_vlm_model(config.name) or bool(_get_vlm_auxiliary_modules(model))
     if is_vlm:
-        if hasattr(model, "model") and hasattr(model.model, "visual"):
-            vision_encoder = model.model.visual
-        elif hasattr(model, "visual"):
-            vision_encoder = model.visual
-        else:
-            raise ValueError(f"VLM model {config.name} does not have a recognized vision encoder attribute")
+        vlm_modules = _get_vlm_auxiliary_modules(model)
+        if not vlm_modules:
+            raise ValueError(f"VLM model {config.name} does not have recognized multimodal auxiliary modules")
 
-        fully_shard(
-            vision_encoder,
-            mesh=hsdp_mesh,
-            **fsdp_config,
-        )
-        get_logger().info("Applied FSDP to frozen vision encoder")
+        for _, module in vlm_modules:
+            fully_shard(
+                module,
+                mesh=hsdp_mesh,
+                **fsdp_config,
+            )
+        get_logger().info(f"Applied FSDP to frozen VLM auxiliary modules: {[name for name, _ in vlm_modules]}")
 
     # Get the language model layers (handle VLM structure)
     # For Qwen3-VL: model.model.language_model contains the transformer layers
@@ -607,8 +617,31 @@ def can_reinit_empty_buffers(model: nn.Module):
     if set(buffer_names) == gemma3_buffers:
         return True
 
+    mistral3_buffers = {
+        "model.vision_tower.patch_positional_embedding.inv_freq",
+        "model.vision_tower.patch_positional_embedding.original_inv_freq",
+        "model.language_model.rotary_emb.inv_freq",
+        "model.language_model.rotary_emb.original_inv_freq",
+    }
+    if set(buffer_names) == mistral3_buffers:
+        return True
+
     get_logger().warning(f"Model cannot be loaded using meta device because of buffers: {buffer_names}")
     return False
+
+
+def _reset_rotary_embedding(rotary_emb: nn.Module) -> bool:
+    compute_default = getattr(type(rotary_emb), "compute_default_rope_parameters", None)
+    if compute_default is None or not hasattr(rotary_emb, "config") or not hasattr(rotary_emb, "inv_freq"):
+        return False
+
+    inv_freq, attention_scaling = compute_default(rotary_emb.config, rotary_emb.inv_freq.device)
+    rotary_emb.inv_freq.copy_(inv_freq)
+    if hasattr(rotary_emb, "original_inv_freq"):
+        rotary_emb.original_inv_freq.copy_(inv_freq)
+    if hasattr(rotary_emb, "attention_scaling"):
+        rotary_emb.attention_scaling = attention_scaling
+    return True
 
 
 def fix_model_post_empty(model: nn.Module):
@@ -629,6 +662,10 @@ def fix_model_post_empty(model: nn.Module):
     if "model.embed_tokens.embed_scale" in buffer_names:
         embed_scale = model.config.hidden_size**0.5
         model.model.embed_tokens.embed_scale.fill_(embed_scale)
+    if "model.language_model.rotary_emb.inv_freq" in buffer_names:
+        _reset_rotary_embedding(model.model.language_model.rotary_emb)
+    if "model.vision_tower.patch_positional_embedding.inv_freq" in buffer_names:
+        _reset_rotary_embedding(model.model.vision_tower.patch_positional_embedding)
 
 
 def reshard_module(model: nn.Module):
@@ -804,9 +841,10 @@ def forward(
     labels: Int[Tensor, "batch seq"] | None = None,
     temperature: Tensor | None = None,
     routed_experts: Int[Tensor, "batch seq layers topk"] | None = None,
-    # Multimodal fields (Qwen3-VL)
-    pixel_values: Float[Tensor, "num_patches patch_dim"] | None = None,
+    # Multimodal fields
+    pixel_values: Tensor | None = None,
     image_grid_thw: Int[Tensor, "num_images 3"] | None = None,
+    image_sizes: Int[Tensor, "num_images 2"] | None = None,
 ) -> PrimeLmOutput:
     # Build kwargs for model forward
     kwargs = {
@@ -815,12 +853,16 @@ def forward(
         "temperature": temperature,
     }
 
-    # For multimodal (VLM), don't pass position_ids - let the model compute MRoPE internally
-    # using image_grid_thw. Qwen3-VL only computes proper MRoPE when position_ids is None.
+    # For multimodal (VLM), don't pass position_ids and let the HF model derive them from image metadata.
     if pixel_values is not None:
-        assert image_grid_thw is not None, "pixel_values requires image_grid_thw for MRoPE computation"
+        assert image_grid_thw is not None or image_sizes is not None, (
+            "pixel_values requires either image_grid_thw or image_sizes for multimodal position handling"
+        )
         kwargs["pixel_values"] = pixel_values
-        kwargs["image_grid_thw"] = image_grid_thw
+        if image_grid_thw is not None:
+            kwargs["image_grid_thw"] = image_grid_thw
+        if image_sizes is not None:
+            kwargs["image_sizes"] = image_sizes
     else:
         kwargs["position_ids"] = position_ids
 

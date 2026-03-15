@@ -12,6 +12,7 @@ from transformers.configuration_utils import PretrainedConfig
 SUPPORTED_VLM_PATTERNS = [
     "Qwen/Qwen3-VL*",
     "Qwen/Qwen3.5*",
+    "mistralai/Ministral-3*",
 ]
 
 DEFAULT_LAYER_PREFIX = "model.layers."
@@ -24,6 +25,7 @@ VLM_REGISTRY: dict[str, str] = {
     "qwen3_vl": "model.language_model.layers.",
     "qwen3_5": "model.language_model.layers.",
     "qwen3_5_moe": "model.language_model.layers.",
+    "mistral3": "model.language_model.layers.",
 }
 
 # Derived from the registry — used by is_vlm_config()

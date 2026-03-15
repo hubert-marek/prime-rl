@@ -13,7 +13,7 @@ from prime_rl.transport import TrainingSample
 from prime_rl.utils.logger import get_logger
 
 # We use list() instead of deepcopy() for flat lists (token IDs, logprobs) - safe because
-# primitives are immutable. pixel_values/image_grid_thw are not mutated after creation.
+# primitives are immutable. Multimodal payloads are not mutated after creation.
 
 
 def _align_routed_experts(
@@ -178,10 +178,15 @@ def interleave_rollout(
     if vlm_cache is not None:
         key = output["example_id"] if cache_key is None else cache_key
         for _, sample, last_step_idx in active_samples:
-            pv, shape, grids = vlm_cache.get_for_step(key, last_step_idx)
+            pv, shape, metadata = vlm_cache.get_for_step(key, last_step_idx)
             sample.pixel_values = pv
             sample.pixel_values_shape = shape
-            sample.image_grid_thw = grids
+            if vlm_cache.metadata_kind == "image_grid_thw":
+                sample.image_grid_thw = metadata
+                sample.image_sizes = None
+            else:
+                sample.image_sizes = metadata
+                sample.image_grid_thw = None
 
     return [sample for _, sample, _ in active_samples]
 
@@ -392,14 +397,14 @@ class _ImageStore:
     def __init__(
         self,
         image_bytes: list[bytes],
-        image_num_patches: list[int],
-        patch_dim: int,
-        image_grids: list[list[int]],
+        image_shapes: list[list[int]],
+        metadata_kind: str,
+        image_metadata: list[list[int]],
     ):
         self.image_bytes = image_bytes
-        self.image_num_patches = image_num_patches
-        self.patch_dim = patch_dim
-        self.image_grids = image_grids
+        self.image_shapes = image_shapes
+        self.metadata_kind = metadata_kind
+        self.image_metadata = image_metadata
         self._cache: dict[tuple[int, ...], tuple[bytes, list[int], list[list[int]]]] = {}
 
     def assemble(self, indices: list[int]) -> tuple[bytes, list[int], list[list[int]]]:
@@ -414,11 +419,25 @@ class _ImageStore:
         if cached is not None:
             return cached
 
-        total_patches = sum(self.image_num_patches[i] for i in indices)
-        pixel_bytes = b"".join(self.image_bytes[i] for i in indices)
-        shape = [total_patches, self.patch_dim]
-        grids = [self.image_grids[i] for i in indices]
-        result = (pixel_bytes, shape, grids)
+        metadata = [self.image_metadata[i] for i in indices]
+        if self.metadata_kind == "image_grid_thw":
+            total_patches = sum(self.image_shapes[i][0] for i in indices)
+            patch_dim = self.image_shapes[indices[0]][1]
+            pixel_bytes = b"".join(self.image_bytes[i] for i in indices)
+            shape = [total_patches, patch_dim]
+            result = (pixel_bytes, shape, metadata)
+        else:
+            channels = self.image_shapes[indices[0]][0]
+            max_height = max(self.image_shapes[i][1] for i in indices)
+            max_width = max(self.image_shapes[i][2] for i in indices)
+            batch = torch.zeros((len(indices), channels, max_height, max_width), dtype=torch.float32)
+            for batch_idx, image_idx in enumerate(indices):
+                image = torch.frombuffer(bytearray(self.image_bytes[image_idx]), dtype=torch.float32).reshape(
+                    self.image_shapes[image_idx]
+                )
+                _, height, width = image.shape
+                batch[batch_idx, :, :height, :width] = image
+            result = (batch.numpy().tobytes(), list(batch.shape), metadata)
         self._cache[cache_key] = result
         return result
 
@@ -449,9 +468,9 @@ def _preprocess_images_batched(
     # (PIL/numpy release the GIL so threads give real concurrency here)
     chunks = [images[i : i + chunk_size] for i in range(0, len(images), chunk_size)]
 
-    def _process_chunk(chunk: list[Image.Image]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _process_chunk(chunk: list[Image.Image]) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         processed = processor.image_processor(images=chunk, return_tensors="pt")
-        return processed["pixel_values"], processed["image_grid_thw"]
+        return processed["pixel_values"], processed.get("image_grid_thw"), processed.get("image_sizes")
 
     if len(chunks) > 1:
         with ThreadPoolExecutor(max_workers=min(len(chunks), 8)) as pool:
@@ -463,41 +482,50 @@ def _preprocess_images_batched(
     del chunks
     images.clear()
 
-    all_pixel_values_list = [r[0] for r in results]
-    all_grid_thw_list = [r[1] for r in results]
-
-    all_pixel_values = torch.cat(all_pixel_values_list, dim=0)
-    all_grid_thw = torch.cat(all_grid_thw_list, dim=0)
-    del all_pixel_values_list, all_grid_thw_list, results
-
-    logger.debug(
-        f"VLM image processing: {len(image_sizes)} images, sizes={image_sizes}, "
-        f"pixel_values={all_pixel_values.shape}, grid_thw={all_grid_thw.tolist()}"
-    )
-
-    # Pre-compute patch start offset for each image
-    patch_starts = [0]
-    for g in all_grid_thw:
-        patch_starts.append(patch_starts[-1] + int(g[0] * g[1] * g[2]))
-
-    patch_dim = all_pixel_values.shape[1]
-
-    # Convert to bytes per-image and free the tensor immediately after
+    metadata_kind = "image_grid_thw" if results[0][1] is not None else "image_sizes"
     image_bytes_list: list[bytes] = []
-    image_num_patches_list: list[int] = []
-    image_grids_list: list[list[int]] = []
-    for i in range(len(image_sizes)):
-        img_slice = all_pixel_values[patch_starts[i] : patch_starts[i + 1]]
-        image_bytes_list.append(img_slice.numpy().tobytes())
-        image_num_patches_list.append(img_slice.shape[0])
-        image_grids_list.append(all_grid_thw[i].tolist())
-    del all_pixel_values, all_grid_thw
+    image_shapes_list: list[list[int]] = []
+    image_metadata_list: list[list[int]] = []
+
+    if metadata_kind == "image_grid_thw":
+        all_pixel_values_list = [r[0] for r in results]
+        all_grid_thw_list = [r[1] for r in results if r[1] is not None]
+
+        all_pixel_values = torch.cat(all_pixel_values_list, dim=0)
+        all_grid_thw = torch.cat(all_grid_thw_list, dim=0)
+        del all_pixel_values_list, all_grid_thw_list, results
+
+        logger.debug(
+            f"VLM image processing: {len(image_sizes)} images, sizes={image_sizes}, "
+            f"pixel_values={all_pixel_values.shape}, grid_thw={all_grid_thw.tolist()}"
+        )
+
+        patch_starts = [0]
+        for g in all_grid_thw:
+            patch_starts.append(patch_starts[-1] + int(g[0] * g[1] * g[2]))
+
+        for i in range(len(image_sizes)):
+            img_slice = all_pixel_values[patch_starts[i] : patch_starts[i + 1]]
+            image_bytes_list.append(img_slice.numpy().tobytes())
+            image_shapes_list.append(list(img_slice.shape))
+            image_metadata_list.append(all_grid_thw[i].tolist())
+        del all_pixel_values, all_grid_thw
+    else:
+        logger.debug(f"VLM image processing: {len(image_sizes)} images, sizes={image_sizes}, metadata=image_sizes")
+        for pixel_values, _, image_sizes_tensor in results:
+            assert image_sizes_tensor is not None
+            for image_tensor, image_size in zip(pixel_values, image_sizes_tensor, strict=True):
+                image_tensor = image_tensor.contiguous()
+                image_bytes_list.append(image_tensor.numpy().tobytes())
+                image_shapes_list.append(list(image_tensor.shape))
+                image_metadata_list.append(image_size.tolist())
+        del results
 
     store = _ImageStore(
         image_bytes=image_bytes_list,
-        image_num_patches=image_num_patches_list,
-        patch_dim=patch_dim,
-        image_grids=image_grids_list,
+        image_shapes=image_shapes_list,
+        metadata_kind=metadata_kind,
+        image_metadata=image_metadata_list,
     )
 
     return store, step_image_indices_per_example
@@ -512,6 +540,7 @@ class VLMImageCache:
         num_unique_examples: int,
         extract_time: float,
         preprocess_time: float,
+        metadata_kind: str = "image_grid_thw",
     ):
         self._store: _ImageStore | None = None
         self._step_indices: dict[int, list[list[int]]] | None = None
@@ -520,6 +549,7 @@ class VLMImageCache:
         self.num_unique_images = 0
         self.extract_time = extract_time
         self.preprocess_time = preprocess_time
+        self.metadata_kind = metadata_kind
 
     @classmethod
     def from_store(
@@ -530,6 +560,7 @@ class VLMImageCache:
         num_unique_images: int,
         extract_time: float,
         preprocess_time: float,
+        metadata_kind: str = "image_grid_thw",
     ) -> "VLMImageCache":
         """Create a store-backed cache that assembles bytes lazily."""
         obj = cls.__new__(cls)
@@ -540,6 +571,7 @@ class VLMImageCache:
         obj.num_unique_images = num_unique_images
         obj.extract_time = extract_time
         obj.preprocess_time = preprocess_time
+        obj.metadata_kind = metadata_kind
         return obj
 
     def _assemble(self, indices: list[int]) -> tuple[bytes | None, list[int] | None, list[list[int]] | None]:
@@ -603,4 +635,5 @@ def build_vlm_image_cache(rollouts: list[vf.RolloutOutput], processor) -> VLMIma
         num_unique_images=num_unique_images,
         extract_time=extract_time,
         preprocess_time=preprocess_time,
+        metadata_kind=store.metadata_kind if store is not None else "image_grid_thw",
     )

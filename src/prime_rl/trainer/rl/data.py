@@ -31,11 +31,10 @@ class TensorMicroBatch(TypedDict):
     # MoE router replay
     routed_experts: Int[Tensor, "batch seq layers topk"] | None
 
-    # Multimodal fields (Qwen3-VL)
-    # pixel_values: flattened image patches [num_patches, patch_dim] where patch_dim=1176 for Qwen3-VL
-    pixel_values: Float[Tensor, "num_patches patch_dim"] | None
-    # image_grid_thw: grid dimensions [num_images, 3] where each entry is [temporal, height, width]
+    # Multimodal fields
+    pixel_values: Tensor | None
     image_grid_thw: Int[Tensor, "num_images 3"] | None
+    image_sizes: Int[Tensor, "num_images 2"] | None
 
 
 class FakeDataLoader:
@@ -108,6 +107,7 @@ class FakeDataLoader:
             "routed_experts": None,
             "pixel_values": None,
             "image_grid_thw": None,
+            "image_sizes": None,
         }
 
     def _get_micro_batch(self, generator: torch.Generator) -> TensorMicroBatch:
@@ -133,6 +133,7 @@ class FakeDataLoader:
             "routed_experts": None,
             "pixel_values": None,
             "image_grid_thw": None,
+            "image_sizes": None,
         }
 
 
@@ -201,6 +202,9 @@ class DataLoader:
             else None,
             image_grid_thw=torch.tensor(micro_batch.image_grid_thw, dtype=torch.long)
             if micro_batch.image_grid_thw is not None
+            else None,
+            image_sizes=torch.tensor(micro_batch.image_sizes, dtype=torch.long)
+            if micro_batch.image_sizes is not None
             else None,
             routed_experts=torch.tensor(micro_batch.routed_experts, dtype=torch.int32).unsqueeze(
                 0

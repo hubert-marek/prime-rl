@@ -63,10 +63,11 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         teacher_logprobs=teacher_logprobs,
         temperatures=temperatures,
         routed_experts=routed_experts,
-        # Multimodal fields (Qwen3-VL) - passed through without modification
+        # Multimodal fields are passed through without modification
         pixel_values=training_example.pixel_values,
         pixel_values_shape=training_example.pixel_values_shape,
         image_grid_thw=training_example.image_grid_thw,
+        image_sizes=training_example.image_sizes,
     )
 
 

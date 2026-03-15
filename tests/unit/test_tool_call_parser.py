@@ -43,5 +43,9 @@ def test_auto_unknown_model():
     assert resolve_tool_call_parser("some/unknown-model", "auto") is None
 
 
+def test_auto_ministral3_model_requires_explicit_parser():
+    assert resolve_tool_call_parser("mistralai/Ministral-3-14B-Instruct-2512-BF16", "auto") is None
+
+
 def test_none_skips_resolution():
     assert resolve_tool_call_parser("Qwen/Qwen3-0.6B", None) is None

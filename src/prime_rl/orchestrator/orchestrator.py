@@ -26,7 +26,7 @@ monkey_patch_chat_completion_logprobs()
 
 import pandas as pd
 import verifiers as vf
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from prime_rl.configs.orchestrator import BufferConfig, OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
@@ -68,7 +68,7 @@ from prime_rl.utils.utils import (
     strip_env_version,
     to_col_format,
 )
-from prime_rl.utils.vlm import is_vlm_model
+from prime_rl.utils.vlm import is_vlm_config, is_vlm_model
 
 
 @clean_exit
@@ -127,6 +127,9 @@ async def orchestrate(config: OrchestratorConfig):
 
     # Check if this is a vision-language model (used throughout for VLM-specific paths)
     is_vlm = is_vlm_model(config.model.name)
+    if not is_vlm:
+        model_config = AutoConfig.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
+        is_vlm = is_vlm_config(model_config)
 
     # Load tokenizer and processor (processor only for VLM models)
     logger.info(f"Initializing tokenizer for {config.model.name}")
