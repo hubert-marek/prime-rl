@@ -474,20 +474,58 @@ def monkey_patch_mistral3_for_text_only_inference():
     Remove once upstream vLLM handles nested ``ministral3`` text towers
     directly.
     """
-    from vllm.model_executor.models.mistral3 import Mistral3ForConditionalGeneration
+    from vllm.model_executor.models.mistral3 import (
+        Mistral3DummyInputsBuilder,
+        Mistral3ForConditionalGeneration,
+        Mistral3ProcessingInfo,
+    )
 
     original_init = Mistral3ForConditionalGeneration.__init__
     if getattr(original_init, "_prime_rl_mistral3_patch", False):
         return
 
+    original_get_supported_mm_limits = Mistral3ProcessingInfo.get_supported_mm_limits
+    original_get_dummy_text = Mistral3DummyInputsBuilder.get_dummy_text
+    original_get_dummy_mm_data = Mistral3DummyInputsBuilder.get_dummy_mm_data
+
     def patched_init(self, *, vllm_config, prefix: str = ""):
         config = vllm_config.model_config.hf_config
+        model_name = vllm_config.model_config.model
         text_config = getattr(config, "text_config", None)
         if text_config is not None and text_config.model_type in {"mistral", "ministral3"} and (
             text_config.architectures is None or text_config.architectures == ["Ministral3ForCausalLM"]
         ):
             text_config.architectures = ["MistralForCausalLM"]
+        # Local merged checkpoints are used for text-only serving. vLLM still
+        # treats Mistral3 as multimodal during startup and runs a dummy Pixtral
+        # processor pass with an [IMG] token, which crashes for the merged
+        # text-only export. Flag these models so we can disable the image budget
+        # warmup path below while keeping the same model weights.
+        config._prime_rl_text_only_mistral3 = model_name.startswith("/") or model_name.startswith(".") or model_name.startswith(
+            "outputs/"
+        )
         return original_init(self, vllm_config=vllm_config, prefix=prefix)
+
+    def patched_get_supported_mm_limits(self):
+        hf_config = self.get_hf_config()
+        if getattr(hf_config, "_prime_rl_text_only_mistral3", False):
+            return {}
+        return original_get_supported_mm_limits(self)
+
+    def patched_get_dummy_text(self, mm_counts):
+        hf_config = self.info.get_hf_config()
+        if getattr(hf_config, "_prime_rl_text_only_mistral3", False):
+            return ""
+        return original_get_dummy_text(self, mm_counts)
+
+    def patched_get_dummy_mm_data(self, seq_len, mm_counts, mm_options):
+        hf_config = self.info.get_hf_config()
+        if getattr(hf_config, "_prime_rl_text_only_mistral3", False):
+            return {}
+        return original_get_dummy_mm_data(self, seq_len, mm_counts, mm_options)
 
     patched_init._prime_rl_mistral3_patch = True
     Mistral3ForConditionalGeneration.__init__ = patched_init
+    Mistral3ProcessingInfo.get_supported_mm_limits = patched_get_supported_mm_limits
+    Mistral3DummyInputsBuilder.get_dummy_text = patched_get_dummy_text
+    Mistral3DummyInputsBuilder.get_dummy_mm_data = patched_get_dummy_mm_data
