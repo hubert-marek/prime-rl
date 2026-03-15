@@ -1,0 +1,67 @@
+# Environment-only scaffold for `hubert-marek/agent-diff-bench`.
+# This file preserves the original env/sampling choices, but it is not a full
+# `uv run rl` config by itself.
+#
+# Next steps for merged Ministral-3 RL:
+# 1. Merge the adapter with `uv run python merge_model.py`
+# 2. Start text-only inference on the merged model
+# 3. Launch RL with `configs/agent_diff_bench/rl_ministral_merged.toml`
+# 4. Keep `secrets.env` local-only; it is ignored by `.gitignore`
+#
+# See `configs/agent_diff_bench/README.md` for the full sequence.
+
+model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+max_steps = 100
+batch_size = 256
+rollouts_per_example = 8
+
+#oversampling_factor = 1.5
+#max_async_level = 2
+# trajectory_strategy = "interleaved"  # or "branching"
+# learning_rate = 1e-4
+# lora_alpha = 16
+env_file = ["secrets.env"]
+
+[sampling]
+max_tokens = 4096
+
+[[env]]
+id = "hubert-marek/agent-diff-bench"
+args = { service = "slack,linear", task_horizon = 8, tool_efficiency_weight = 0.0, max_turns = 30 }
+
+[wandb]
+project = "agent-diff"
+name = "qwen3-30b-i-agent-diff"
+entity = "g-tsvetkova-minerva-university"
+
+# Optional: W&B logging
+# [wandb]
+# project = "gsm8k"
+# name = "qwen3-30b-i-gsm8k"
+# entity = "my-team"
+
+[eval]
+interval = 5
+rollouts_per_example = 2
+
+[[eval.env]]
+id = "hubert-marek/agent-diff-bench"
+args = { service = "slack,linear", task_horizon = 8, tool_efficiency_weight = 0.0, max_turns = 30 }
+num_examples = -1
+
+# Optional: validation during training
+# [val]
+# num_examples = 64
+# rollouts_per_example = 1
+# interval = 5
+
+# Optional: buffer configuration for difficulty filtering
+# [buffer]
+# easy_threshold = 0.8
+# hard_threshold = 0.2
+# easy_fraction = 0.0
+# hard_fraction = 0.0
+# online_difficulty_filtering = false
+# env_ratios = [0.5, 0.5]
+# seed = 42
+

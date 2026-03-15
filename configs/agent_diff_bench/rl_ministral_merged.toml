@@ -1,0 +1,64 @@
+output_dir = "outputs/agent_diff_mistral_rl"
+max_steps = 100
+max_async_level = 1
+seq_len = 4096
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 0
+
+[model]
+name = "outputs/Ministral-3-14B-Agent-Diff-SFT-merged"
+
+[wandb]
+project = "agent-diff"
+name = "ministral-3-agent-diff-rl"
+
+[client]
+base_url = ["http://127.0.0.1:8010/v1"]
+
+[trainer.optim]
+lr = 1e-5
+weight_decay = 0.0
+
+[trainer.model.lora]
+rank = 64
+alpha = 128
+dropout = 0.05
+target_modules = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+]
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[orchestrator]
+batch_size = 64
+rollouts_per_example = 4
+oversampling_factor = 1.5
+
+[orchestrator.model.lora]
+name = "ministral-3-agent-diff"
+
+[orchestrator.sampling]
+max_tokens = 1024
+temperature = 0.5
+
+[[orchestrator.env]]
+id = "hubert-marek/agent-diff-bench"
+args = { service = "slack,linear", task_horizon = 8, tool_efficiency_weight = 0.0, max_turns = 30 }
+
+[eval]
+interval = 10
+rollouts_per_example = 1
+
+[[eval.env]]
+id = "hubert-marek/agent-diff-bench"
+args = { service = "slack,linear", task_horizon = 8, tool_efficiency_weight = 0.0, max_turns = 30 }
+num_examples = -1
