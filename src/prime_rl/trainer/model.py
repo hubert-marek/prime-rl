@@ -10,18 +10,37 @@ from beartype import beartype as typechecker
 from huggingface_hub import snapshot_download
 from jaxtyping import Float, Int, jaxtyped
 from torch import Tensor
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+)
 from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy, OffloadPolicy, fully_shard
+from torch.distributed.fsdp import (
+    CPUOffloadPolicy,
+    FSDPModule,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
+    fully_shard,
+)
 from torch.distributed.tensor.parallel import parallelize_module
 from torchtitan.distributed.expert_parallel import ExpertParallel
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig, PretrainedConfig
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GenerationConfig,
+    PretrainedConfig,
+)
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.utils.import_utils import is_flash_attn_3_available
 
-from prime_rl.configs.trainer import ActivationCheckpointConfig, CompileConfig, ModelConfig, TokenizerConfig
+from prime_rl.configs.trainer import (
+    ActivationCheckpointConfig,
+    CompileConfig,
+    ModelConfig,
+    TokenizerConfig,
+)
 from prime_rl.trainer.lora import apply_lora_to_model, strip_lora_from_state_dict
 from prime_rl.trainer.models import (
     AutoModelForCausalLMPrimeRL,
@@ -62,7 +81,9 @@ def _patch_qwen3_5_moe_conversion_mapping():
     # qwen3_5_moe_text: keep only the qwen3_5_text renaming, remove qwen2_moe expert conversion
     qwen3_5_text_mapping = get_checkpoint_conversion_mapping("qwen3_5_text")
     if qwen3_5_text_mapping is not None:
-        register_checkpoint_conversion_mapping("qwen3_5_moe_text", qwen3_5_text_mapping, overwrite=True)
+        register_checkpoint_conversion_mapping(
+            "qwen3_5_moe_text", qwen3_5_text_mapping, overwrite=True
+        )
 
     # qwen3_5_moe: remove the qwen2_moe fallback entirely
     register_checkpoint_conversion_mapping("qwen3_5_moe", [], overwrite=True)
@@ -76,15 +97,24 @@ def _patch_qwen3_5_text_position_ids():
     """
     import inspect
 
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5TextModel
-    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer, Qwen3_5MoeTextModel
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5DecoderLayer,
+        Qwen3_5TextModel,
+    )
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeDecoderLayer,
+        Qwen3_5MoeTextModel,
+    )
 
     for text_model_cls, decoder_layer_cls in [
         (Qwen3_5TextModel, Qwen3_5DecoderLayer),
         (Qwen3_5MoeTextModel, Qwen3_5MoeDecoderLayer),
     ]:
         source = inspect.getsource(text_model_cls.forward)
-        if "decoder_layer" in source and "position_ids=text_position_ids" in source.split("decoder_layer")[-1]:
+        if (
+            "decoder_layer" in source
+            and "position_ids=text_position_ids" in source.split("decoder_layer")[-1]
+        ):
             continue  # already fixed upstream
 
         _original_forward = decoder_layer_cls.forward
@@ -93,18 +123,80 @@ def _patch_qwen3_5_text_position_ids():
             def _patched_forward(self, hidden_states, position_ids=None, **kwargs):
                 if position_ids is not None and position_ids.ndim == 3:
                     position_ids = position_ids[0]
-                return original(self, hidden_states, position_ids=position_ids, **kwargs)
+                return original(
+                    self, hidden_states, position_ids=position_ids, **kwargs
+                )
 
             return _patched_forward
 
         decoder_layer_cls.forward = _make_patched_forward(_original_forward)
 
 
+def _normalize_mistral3_text_config_for_text_only_training(
+    model_config: PretrainedConfig,
+) -> None:
+    """Normalize merged Ministral-3 text tower metadata for text-only training.
+
+    Merged HF checkpoints keep the top-level multimodal Mistral3 config, but the
+    nested text tower may still advertise ``Ministral3ForCausalLM``. Align it
+    with the native Mistral text model the same way inference does.
+    """
+
+    text_config = getattr(model_config, "text_config", None)
+    if getattr(model_config, "model_type", None) != "mistral3" or text_config is None:
+        return
+
+    if text_config.model_type in {"mistral", "ministral3"} and (
+        text_config.architectures is None
+        or text_config.architectures == ["Ministral3ForCausalLM"]
+    ):
+        text_config.architectures = ["MistralForCausalLM"]
+
+
+def _is_mistral3_merged_text_only_layout(
+    snapshot_keys: dict[str, None], model_keys: dict[str, None]
+) -> bool:
+    """Detect merged Ministral-3 checkpoints whose key layout mismatches trainer HF model keys."""
+
+    return (
+        any(key.startswith("language_model.model.") for key in snapshot_keys)
+        and any(key.startswith("vision_tower.") for key in snapshot_keys)
+        and any(key.startswith("model.language_model.") for key in model_keys)
+        and not any(key.startswith("model.language_model.") for key in snapshot_keys)
+    )
+
+
+def _convert_mistral3_merged_text_only_state_dict(
+    state_dict: dict[str, Tensor],
+) -> dict[str, Tensor]:
+    """Remap merged Ministral-3 HF checkpoint keys to trainer HF model keys."""
+
+    converted_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("language_model.model."):
+            new_key = (
+                f"model.language_model.{key.removeprefix('language_model.model.')}"
+            )
+        elif key.startswith("language_model.lm_head."):
+            new_key = key.removeprefix("language_model.")
+        elif key.startswith("vision_tower.") or key.startswith(
+            "multi_modal_projector."
+        ):
+            new_key = f"model.{key}"
+        else:
+            new_key = key
+        converted_state_dict[new_key] = value
+    return converted_state_dict
+
+
 # Add filter to the standard logging module for transformers.modeling_utils to supress the
 # flash attention dtype warnings since FSDP is used to handle mixed precision.
 transformers_modeling_utils_logger = logging.getLogger("transformers.modeling_utils")
 transformers_modeling_utils_logger.addFilter(
-    lambda record: "Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes" not in record.getMessage()
+    lambda record: (
+        "Flash Attention 2 only supports torch.float16 and torch.bfloat16 dtypes"
+        not in record.getMessage()
+    )
 )
 
 DTYPE_MAP = {
@@ -123,9 +215,15 @@ def _get_vlm_auxiliary_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:
     candidates = [
         ("model.visual", getattr(getattr(model, "model", None), "visual", None)),
         ("visual", getattr(model, "visual", None)),
-        ("model.vision_tower", getattr(getattr(model, "model", None), "vision_tower", None)),
+        (
+            "model.vision_tower",
+            getattr(getattr(model, "model", None), "vision_tower", None),
+        ),
         ("vision_tower", getattr(model, "vision_tower", None)),
-        ("model.multi_modal_projector", getattr(getattr(model, "model", None), "multi_modal_projector", None)),
+        (
+            "model.multi_modal_projector",
+            getattr(getattr(model, "model", None), "multi_modal_projector", None),
+        ),
         ("multi_modal_projector", getattr(model, "multi_modal_projector", None)),
     ]
 
@@ -151,7 +249,9 @@ def freeze_vision_encoder(model: nn.Module) -> None:
         for param in module.parameters():
             param.requires_grad = False
             num_frozen += 1
-    logger.info(f"Froze {num_frozen} parameters in VLM auxiliary modules: {[name for name, _ in vlm_modules]}")
+    logger.info(
+        f"Froze {num_frozen} parameters in VLM auxiliary modules: {[name for name, _ in vlm_modules]}"
+    )
 
 
 def freeze_moe_router(model: nn.Module) -> None:
@@ -161,7 +261,13 @@ def freeze_moe_router(model: nn.Module) -> None:
     num_frozen = 0
 
     for layer in language_model.layers:
-        mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
+        mlp = (
+            layer.mlp
+            if hasattr(layer, "mlp")
+            else layer.feed_forward
+            if hasattr(layer, "feed_forward")
+            else None
+        )
         if mlp is None:
             continue
 
@@ -177,13 +283,17 @@ def freeze_moe_router(model: nn.Module) -> None:
                 num_frozen += 1
 
     if num_frozen == 0:
-        raise ValueError("No MoE router parameters found to freeze. Is this a MoE model?")
+        raise ValueError(
+            "No MoE router parameters found to freeze. Is this a MoE model?"
+        )
 
     logger.info(f"Froze {num_frozen} MoE router parameters")
 
 
 def is_tt_moe_model(model: nn.Module) -> bool:
-    return hasattr(model.config, "num_experts") or hasattr(model.config, "n_routed_experts")
+    return hasattr(model.config, "num_experts") or hasattr(
+        model.config, "n_routed_experts"
+    )
 
 
 def get_language_model(model: nn.Module) -> nn.Module:
@@ -200,7 +310,9 @@ def get_language_model(model: nn.Module) -> nn.Module:
 
 
 def get_load_balance_stats(
-    model: nn.Module, reset_stats: bool = True, try_to_avoid_padding_experts: bool = True
+    model: nn.Module,
+    reset_stats: bool = True,
+    try_to_avoid_padding_experts: bool = True,
 ) -> dict[str, Tensor | None]:
     per_layer_max_vio = []
     language_model = get_language_model(model)
@@ -224,7 +336,9 @@ def get_load_balance_stats(
 
 
 def get_model(
-    config: ModelConfig, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.bfloat16
+    config: ModelConfig,
+    device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
     logger = get_logger()
     logger.info(
@@ -241,10 +355,13 @@ def get_model(
     model_config = cast(
         PretrainedConfig,
         AutoConfig.from_pretrained(
-            config.name, attn_implementation=config.attn, trust_remote_code=config.trust_remote_code
+            config.name,
+            attn_implementation=config.attn,
+            trust_remote_code=config.trust_remote_code,
         ),
     )
     model_config.use_cache = False
+    _normalize_mistral3_text_config_for_text_only_training(model_config)
 
     # Fallback VLM detection from loaded config (catches local paths)
     if not is_vlm and is_vlm_config(model_config):
@@ -270,7 +387,11 @@ def get_model(
         pad_token_id = next(
             (
                 v
-                for v in [gen_config.pad_token_id, gen_config.eos_token_id, getattr(model_config, "eos_token_id", None)]
+                for v in [
+                    gen_config.pad_token_id,
+                    gen_config.eos_token_id,
+                    getattr(model_config, "eos_token_id", None),
+                ]
                 if v is not None
             ),
             None,
@@ -326,17 +447,25 @@ def get_model(
         use_torch_dtype = is_vlm and model_cls is not custom_vlm_cls
         dtype_kwarg = {"torch_dtype": dtype} if use_torch_dtype else {"dtype": dtype}
         if device == torch.device("meta"):
-            logger.info(f"Loading model {config.name} using {model_cls.__name__} to meta device")
-            model = model_cls.from_config(model_config, trust_remote_code=config.trust_remote_code, **dtype_kwarg)
+            logger.info(
+                f"Loading model {config.name} using {model_cls.__name__} to meta device"
+            )
+            model = model_cls.from_config(
+                model_config, trust_remote_code=config.trust_remote_code, **dtype_kwarg
+            )
         else:
-            logger.info(f"Loading model {config.name} using {model_cls.__name__} to CPU")
+            logger.info(
+                f"Loading model {config.name} using {model_cls.__name__} to CPU"
+            )
             model = model_cls.from_pretrained(
                 pretrained_model_name_or_path=config.name,
                 config=model_config,
                 trust_remote_code=config.trust_remote_code,
                 **dtype_kwarg,
             )
-        logger.debug(f"Loaded model {config.name} in {time.perf_counter() - load_model_start_time:.2f} seconds")
+        logger.debug(
+            f"Loaded model {config.name} in {time.perf_counter() - load_model_start_time:.2f} seconds"
+        )
 
     # For VLM models, freeze the vision encoder
     if is_vlm:
@@ -349,7 +478,9 @@ def get_model(
 
 
 def setup_tokenizer(config: TokenizerConfig) -> PreTrainedTokenizer:
-    tokenizer = AutoTokenizer.from_pretrained(config.name, trust_remote_code=config.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.name, trust_remote_code=config.trust_remote_code
+    )
     if config.chat_template is not None:
         tokenizer.chat_template = config.chat_template
     tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -358,8 +489,14 @@ def setup_tokenizer(config: TokenizerConfig) -> PreTrainedTokenizer:
 
 
 def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
-    mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=DTYPE_MAP[config.reduce_dtype])
-    offload_policy: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if config.fsdp_cpu_offload else OffloadPolicy()
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=DTYPE_MAP[config.reduce_dtype]
+    )
+    offload_policy: OffloadPolicy = (
+        CPUOffloadPolicy(pin_memory=True)
+        if config.fsdp_cpu_offload
+        else OffloadPolicy()
+    )
 
     fsdp_config = {
         "mp_policy": mp_policy,
@@ -383,7 +520,9 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
     if is_vlm:
         vlm_modules = _get_vlm_auxiliary_modules(model)
         if not vlm_modules:
-            raise ValueError(f"VLM model {config.name} does not have recognized multimodal auxiliary modules")
+            raise ValueError(
+                f"VLM model {config.name} does not have recognized multimodal auxiliary modules"
+            )
 
         for _, module in vlm_modules:
             fully_shard(
@@ -391,7 +530,9 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 mesh=hsdp_mesh,
                 **fsdp_config,
             )
-        get_logger().info(f"Applied FSDP to frozen VLM auxiliary modules: {[name for name, _ in vlm_modules]}")
+        get_logger().info(
+            f"Applied FSDP to frozen VLM auxiliary modules: {[name for name, _ in vlm_modules]}"
+        )
 
     # Get the language model layers (handle VLM structure)
     # For Qwen3-VL: model.model.language_model contains the transformer layers
@@ -405,9 +546,13 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
 
     for transformer_block in transformer_layers:
         if parallel_dims.ep_enabled and isinstance(transformer_block.mlp, MoE):
-            fully_shard(transformer_block.mlp.experts, mesh=dp_mod_ep_mesh, **fsdp_config)
+            fully_shard(
+                transformer_block.mlp.experts, mesh=dp_mod_ep_mesh, **fsdp_config
+            )
 
-            transformer_block.mlp.experts.set_gradient_divide_factor(parallel_dims.fsdp_gradient_divide_factor)
+            transformer_block.mlp.experts.set_gradient_divide_factor(
+                parallel_dims.fsdp_gradient_divide_factor
+            )
 
         fully_shard(
             transformer_block,
@@ -415,7 +560,9 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             **fsdp_config,
         )
 
-    shard_norm_and_lm_head = hasattr(model, "config") and not model.config.tie_word_embeddings
+    shard_norm_and_lm_head = (
+        hasattr(model, "config") and not model.config.tie_word_embeddings
+    )
 
     if shard_norm_and_lm_head:
         # This optimization breaks weight tying
@@ -432,7 +579,9 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             reshard_after_forward=False,
         )
     else:
-        get_logger().warning("Model uses tied word embeddings, so skipping the last-layer no-reshard optimization.")
+        get_logger().warning(
+            "Model uses tied word embeddings, so skipping the last-layer no-reshard optimization."
+        )
 
     fully_shard(
         model,
@@ -453,44 +602,66 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
 
     if language_model.embed_tokens is not None and len(language_model.layers) > 0:
         if shard_norm_and_lm_head:
-            language_model.embed_tokens.set_modules_to_forward_prefetch([transformer_blocks[0]])
+            language_model.embed_tokens.set_modules_to_forward_prefetch(
+                [transformer_blocks[0]]
+            )
 
-    for transformer_block, next_transformer_block in zip(transformer_blocks, next_transformer_blocks):
+    for transformer_block, next_transformer_block in zip(
+        transformer_blocks, next_transformer_blocks
+    ):
         if next_transformer_block is not None:
             if isinstance(next_transformer_block.mlp, MoE):
                 transformer_block.set_modules_to_forward_prefetch(
                     [next_transformer_block, next_transformer_block.mlp.experts]
                 )
             else:
-                transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
+                transformer_block.set_modules_to_forward_prefetch(
+                    [next_transformer_block]
+                )
         elif language_model.norm is not None and model.lm_head is not None:
             if shard_norm_and_lm_head:
-                transformer_block.set_modules_to_forward_prefetch([language_model.norm, model.lm_head])
+                transformer_block.set_modules_to_forward_prefetch(
+                    [language_model.norm, model.lm_head]
+                )
 
     # backward
     reversed_transformer_blocks = list(reversed(language_model.layers))
     prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
-    if language_model.norm is not None and model.lm_head is not None and len(language_model.layers) > 0:
+    if (
+        language_model.norm is not None
+        and model.lm_head is not None
+        and len(language_model.layers) > 0
+    ):
         if shard_norm_and_lm_head:
-            model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+            model.lm_head.set_modules_to_backward_prefetch(
+                [reversed_transformer_blocks[0]]
+            )
         else:
             model.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
 
-    for transformer_block, prev_transformer_block in zip(reversed_transformer_blocks, prev_transformer_blocks):
+    for transformer_block, prev_transformer_block in zip(
+        reversed_transformer_blocks, prev_transformer_blocks
+    ):
         if prev_transformer_block is not None:
             if isinstance(prev_transformer_block.mlp, MoE):
                 transformer_block.set_modules_to_backward_prefetch(
                     [prev_transformer_block, prev_transformer_block.mlp.experts]
                 )
             else:
-                transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
+                transformer_block.set_modules_to_backward_prefetch(
+                    [prev_transformer_block]
+                )
         elif language_model.embed_tokens is not None:
             if shard_norm_and_lm_head:
-                transformer_block.set_modules_to_backward_prefetch([language_model.embed_tokens])
+                transformer_block.set_modules_to_backward_prefetch(
+                    [language_model.embed_tokens]
+                )
 
 
-def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+def load_dcp_from_hf(
+    model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims
+):
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
     torch.distributed.barrier()
@@ -519,11 +690,12 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     # Dynamically convert between different weight formats if needed.
     # All ranks read just the key names (cheap) to determine the path independently.
     # Only master loads the full state dict when conversion is actually needed.
+    snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
+    model_keys = dict.fromkeys(model.state_dict().keys())
     if isinstance(model, PreTrainedModelPrimeRL):
-        snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
-        model_keys = dict.fromkeys(model.state_dict().keys())
-
-        if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
+        if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(
+            model_keys
+        ):
             logger.warning(
                 "Found HF weight format in snapshot state dict and PrimeRL weight format in model state dict. Trying to auto-convert..."
             )
@@ -537,7 +709,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                 save_state_dict(snapshot_state_dict, snapshot_path)
                 del snapshot_state_dict
 
-        elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
+        elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(
+            model_keys
+        ):
             logger.warning(
                 "Found PrimeRL weight format in snapshot state dict and HF weight format in model state dict. Trying to auto-convert..."
             )
@@ -550,6 +724,22 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                 model.convert_to_hf(snapshot_state_dict)
                 save_state_dict(snapshot_state_dict, snapshot_path)
                 del snapshot_state_dict
+    elif _is_mistral3_merged_text_only_layout(snapshot_keys, model_keys):
+        logger.warning(
+            "Found merged Mistral3 text-only checkpoint layout and trainer HF VLM keys. Trying to auto-convert..."
+        )
+        snapshot_path = snapshot_path / "trainer_text_only_hf"
+        if not snapshot_path.exists() and get_world().is_master:
+            logger.debug(
+                f"Converting merged Mistral3 checkpoint to trainer HF layout and saving to {snapshot_path} on master rank. "
+                "This is a one-time operation."
+            )
+            snapshot_state_dict = load_state_dict(snapshot_path.parent)
+            snapshot_state_dict = _convert_mistral3_merged_text_only_state_dict(
+                snapshot_state_dict
+            )
+            save_state_dict(snapshot_state_dict, snapshot_path)
+            del snapshot_state_dict
 
     # All ranks wait for master rank to finish conversion
     torch.distributed.barrier()
@@ -565,7 +755,10 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
     )
     # Restore weight tying broken by to_empty() for HF models
-    if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
+    if (
+        not isinstance(model, PreTrainedModelPrimeRL)
+        and model.config.tie_word_embeddings
+    ):
         model.tie_weights()
     _init_buffers_post_meta()
 
@@ -580,11 +773,15 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             seed_tensor = torch.empty(1, dtype=torch.long, device="cuda")
             if dp_replicate_mesh.get_local_rank() == 0:
                 seed_tensor.random_()
-            torch.distributed.broadcast(seed_tensor, src=0, group=dp_replicate_mesh.get_group())
+            torch.distributed.broadcast(
+                seed_tensor, src=0, group=dp_replicate_mesh.get_group()
+            )
             generator = torch.Generator(device="cuda").manual_seed(seed_tensor.item())
         for module in lora_modules:
             module._init_lora_parameters(generator)
-    logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
+    logger.debug(
+        f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds"
+    )
 
 
 def can_reinit_empty_buffers(model: nn.Module):
@@ -603,17 +800,25 @@ def can_reinit_empty_buffers(model: nn.Module):
     buffer_names = [
         name
         for name in buffer_names
-        if not (name.startswith("model.layers.") and name.endswith("mlp.tokens_per_expert"))
+        if not (
+            name.startswith("model.layers.") and name.endswith("mlp.tokens_per_expert")
+        )
     ]
     buffer_names = [
-        name for name in buffer_names if not (name.startswith("model.layers.") and name.endswith("mlp.expert_bias"))
+        name
+        for name in buffer_names
+        if not (name.startswith("model.layers.") and name.endswith("mlp.expert_bias"))
     ]
     # HF standard transformer model
     if len(buffer_names) == 1 and buffer_names[0] == "model.rotary_emb.inv_freq":
         return True
 
     # Gemma3 model (has embed_scale and local rotary emb)
-    gemma3_buffers = {"model.embed_tokens.embed_scale", "model.rotary_emb.inv_freq", "model.rotary_emb_local.inv_freq"}
+    gemma3_buffers = {
+        "model.embed_tokens.embed_scale",
+        "model.rotary_emb.inv_freq",
+        "model.rotary_emb_local.inv_freq",
+    }
     if set(buffer_names) == gemma3_buffers:
         return True
 
@@ -626,16 +831,24 @@ def can_reinit_empty_buffers(model: nn.Module):
     if set(buffer_names) == mistral3_buffers:
         return True
 
-    get_logger().warning(f"Model cannot be loaded using meta device because of buffers: {buffer_names}")
+    get_logger().warning(
+        f"Model cannot be loaded using meta device because of buffers: {buffer_names}"
+    )
     return False
 
 
 def _reset_rotary_embedding(rotary_emb: nn.Module) -> bool:
     compute_default = getattr(type(rotary_emb), "compute_default_rope_parameters", None)
-    if compute_default is None or not hasattr(rotary_emb, "config") or not hasattr(rotary_emb, "inv_freq"):
+    if (
+        compute_default is None
+        or not hasattr(rotary_emb, "config")
+        or not hasattr(rotary_emb, "inv_freq")
+    ):
         return False
 
-    inv_freq, attention_scaling = compute_default(rotary_emb.config, rotary_emb.inv_freq.device)
+    inv_freq, attention_scaling = compute_default(
+        rotary_emb.config, rotary_emb.inv_freq.device
+    )
     rotary_emb.inv_freq.copy_(inv_freq)
     if hasattr(rotary_emb, "original_inv_freq"):
         rotary_emb.original_inv_freq.copy_(inv_freq)
@@ -649,13 +862,17 @@ def fix_model_post_empty(model: nn.Module):
     # HF standard transformer model
     if "model.rotary_emb.inv_freq" in buffer_names:
         rotary_emb = model.model.rotary_emb
-        inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, rotary_emb.inv_freq.device)
+        inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(
+            rotary_emb.config, rotary_emb.inv_freq.device
+        )
         rotary_emb.inv_freq.copy_(inv_freq)
     # Gemma3 local rotary emb
     if "model.rotary_emb_local.inv_freq" in buffer_names:
         rotary_emb_local = model.model.rotary_emb_local
-        inv_freq_local, rotary_emb_local.attention_scaling = rotary_emb_local.rope_init_fn(
-            rotary_emb_local.config, rotary_emb_local.inv_freq.device
+        inv_freq_local, rotary_emb_local.attention_scaling = (
+            rotary_emb_local.rope_init_fn(
+                rotary_emb_local.config, rotary_emb_local.inv_freq.device
+            )
         )
         rotary_emb_local.inv_freq.copy_(inv_freq_local)
     # Gemma3 embed_scale (scalar computed from hidden_size)
@@ -676,9 +893,13 @@ def reshard_module(model: nn.Module):
 
 def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     language_model = get_language_model(model)
-    for layer_id, (layer_name, transformer_block) in enumerate(language_model.layers.named_children()):
+    for layer_id, (layer_name, transformer_block) in enumerate(
+        language_model.layers.named_children()
+    ):
         if layer_id % ac_config.freq == 0:
-            transformer_block = checkpoint_wrapper(transformer_block, preserve_rng_state=False)
+            transformer_block = checkpoint_wrapper(
+                transformer_block, preserve_rng_state=False
+            )
         language_model.layers.register_module(layer_name, transformer_block)
     get_logger().info(f"Applied activation checkpointing (freq={ac_config.freq})")
 
@@ -689,7 +910,9 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
     for layer_id in range(len(language_model.layers)):
         # Doing it in-place avoids mangled fqn which can break checkpoint loading
         language_model.layers[layer_id].compile(fullgraph=compile_config.fullgraph)
-    get_logger().info(f"Compiled {len(language_model.layers)} layers (fullgraph={compile_config.fullgraph})")
+    get_logger().info(
+        f"Compiled {len(language_model.layers)} layers (fullgraph={compile_config.fullgraph})"
+    )
 
 
 def apply_ep(model: nn.Module, parallel_dims: ParallelDims):
@@ -766,7 +989,9 @@ def setup_model(
     logger = get_logger()
 
     # 1. We load to meta device by default
-    model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
+    model = get_model(
+        config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype]
+    )
 
     possible_to_load_to_meta = can_reinit_empty_buffers(model)
 
@@ -778,13 +1003,19 @@ def setup_model(
     # 1a. We load to CPU if we cannot reinit empty buffers
     if not possible_to_load_to_meta:
         logger.warning("Cannot load model to meta device only, loading to CPU instead.")
-        model = get_model(config, device=torch.device("cpu"), dtype=DTYPE_MAP[config.optimization_dtype])
+        model = get_model(
+            config,
+            device=torch.device("cpu"),
+            dtype=DTYPE_MAP[config.optimization_dtype],
+        )
 
     lm_head_chunk_size: int | None = None
     if isinstance(config.fused_lm_head_token_chunk_size, int):
         lm_head_chunk_size = config.fused_lm_head_token_chunk_size
 
-    inject_prime_lm_head(model, chunk_size=lm_head_chunk_size, fused_cross_entropy=fused_cross_entropy)
+    inject_prime_lm_head(
+        model, chunk_size=lm_head_chunk_size, fused_cross_entropy=fused_cross_entropy
+    )
 
     # Apply LoRA before FSDP setup
     if config.lora is not None:
