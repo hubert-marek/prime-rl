@@ -99,6 +99,14 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+## Ministral-3 merged checkpoints
+
+For merged HF checkpoints based on `mistralai/Ministral-3-14B-Instruct-2512-BF16`, use the merged output directory as a normal HF model path. Do not force `config_format = "mistral"` or `load_format = "mistral"` for the merged directory.
+
+This repo includes a temporary vLLM monkey patch in `src/prime_rl/inference/patches.py` that rewrites the nested `ministral3` text tower to use `MistralForCausalLM` during vLLM initialization. This works around a vLLM 0.17.x compatibility bug for text-only inference on merged Ministral-3 checkpoints.
+
+If text-only inference fails after rebuilding the environment, confirm that the `prime_rl` vLLM general plugin is active and that `src/prime_rl/inference/vllm/server.py` still imports and applies `monkey_patch_mistral3_for_text_only_inference()`.
+
 ## Key files
 
 - `src/prime_rl/entrypoints/inference.py` — entrypoint with local/SLURM routing

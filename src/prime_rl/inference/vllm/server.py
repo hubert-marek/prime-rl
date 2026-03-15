@@ -132,6 +132,7 @@ logger = get_logger()
 from prime_rl.inference.patches import (
     monkey_patch_hermes_tool_parser_thread_safety,
     monkey_patch_load_lora_adapter,
+    monkey_patch_mistral3_for_text_only_inference,
     monkey_patch_prometheus_stat_logger_for_lora_in_dp_mode,
     monkey_patch_tokenize_params_validation,
     monkey_patch_tokenizer_thread_safety,
@@ -152,6 +153,8 @@ monkey_patch_hermes_tool_parser_thread_safety()
 # NOTE: Monkeypatch HF tokenizer to fix "Already borrowed" RuntimeError during concurrent chat template processing
 # Can be removed once https://github.com/vllm-project/vllm/pull/36557 is merged and we upgrade vllm
 monkey_patch_tokenizer_thread_safety()
+# NOTE: Monkeypatch Mistral3 nested text tower routing until upstream vLLM handles Ministral3 natively
+monkey_patch_mistral3_for_text_only_inference()
 
 logger = init_logger("vllm.entrypoints.openai.api_server")
 

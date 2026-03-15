@@ -10,6 +10,7 @@ def transformers_v5_compat():
         Qwen3VLMoeTextConfig.tie_word_embeddings = False
 
     _patch_qwen35_lora()
+    monkey_patch_mistral3_for_text_only_inference()
 
 
 def _patch_qwen35_lora():
@@ -453,3 +454,40 @@ def monkey_patch_minimax_m2_for_lora():
             ".up_proj.": ".w3.",
         },
     )
+
+
+def monkey_patch_mistral3_for_text_only_inference():
+    """Patch vLLM 0.17.x to route Ministral3 text towers through native Mistral.
+
+    vLLM's Mistral3 wrapper initializes the nested text tower from
+    ``config.text_config``. On merged HF checkpoints, that nested config keeps
+    ``model_type='ministral3'`` and may have ``architectures`` unset or set to
+    ``["Ministral3ForCausalLM"]``. vLLM 0.17.x does not register a native
+    ``Ministral3ForCausalLM`` backend, so it falls back to the generic
+    Transformers backend and then crashes during text-only inference warmup.
+
+    Fix: normalize the nested architecture to ``MistralForCausalLM`` before the
+    wrapper initializes the language tower. This preserves the top-level
+    multimodal ``Mistral3ForConditionalGeneration`` path while using vLLM's
+    native Mistral backend for the inner text model.
+
+    Remove once upstream vLLM handles nested ``ministral3`` text towers
+    directly.
+    """
+    from vllm.model_executor.models.mistral3 import Mistral3ForConditionalGeneration
+
+    original_init = Mistral3ForConditionalGeneration.__init__
+    if getattr(original_init, "_prime_rl_mistral3_patch", False):
+        return
+
+    def patched_init(self, *, vllm_config, prefix: str = ""):
+        config = vllm_config.model_config.hf_config
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None and text_config.model_type in {"mistral", "ministral3"} and (
+            text_config.architectures is None or text_config.architectures == ["Ministral3ForCausalLM"]
+        ):
+            text_config.architectures = ["MistralForCausalLM"]
+        return original_init(self, vllm_config=vllm_config, prefix=prefix)
+
+    patched_init._prime_rl_mistral3_patch = True
+    Mistral3ForConditionalGeneration.__init__ = patched_init
