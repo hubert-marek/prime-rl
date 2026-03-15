@@ -149,6 +149,19 @@ class Scheduler:
         forced_rollout["metrics"] = metrics
         return forced_rollout
 
+    @staticmethod
+    def _is_timeout_transport_error(rollout: vf.RolloutOutput) -> bool:
+        error = rollout.get("error")
+        if error is None:
+            return False
+
+        error_chain = error.get("error_chain_repr", "")
+        timeout_markers = (
+            "APITimeoutError",
+            "ConnectTimeout",
+        )
+        return any(marker in error_chain for marker in timeout_markers)
+
     @property
     def uses_token_batching(self) -> bool:
         return self.token_batch_size is not None
@@ -456,9 +469,18 @@ class Scheduler:
                         )
                     if should_reschedule:
                         group.reschedule_count += 1
-                        max_group_reschedules = self.max_group_reschedules_by_task.get(task, 3)
+                        max_group_reschedules = self.max_group_reschedules_by_task.get(task, 5)
                         if group.reschedule_count <= max_group_reschedules:
                             group.rollouts_to_schedule += 1
+                            continue
+
+                        if self._is_timeout_transport_error(rollout):
+                            self.dropped_groups_by_task[task] += 1
+                            self.logger.warning(
+                                f"Rollout group {group_id} ({task}) exceeded max_group_reschedules={max_group_reschedules} "
+                                "due to inference transport timeouts. Dropping group instead of converting it into a zero-reward training example."
+                            )
+                            await self.drop_group(group_id)
                             continue
 
                         if self._rollout_has_generated_tokens(rollout):
