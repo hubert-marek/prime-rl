@@ -1,14 +1,15 @@
 output_dir = "outputs/agent_diff_mistral_rl"
 max_steps = 50
-max_async_level = 2
-seq_len = 16384
+max_async_level = 0
+seq_len = 15360
 
 [ckpt]
 interval = 2
+resume_step = 1
 
 [deployment]
-num_train_gpus = 1
-num_infer_gpus = 1
+num_train_gpus = 2
+num_infer_gpus = 2
 
 [model]
 name = "outputs/Ministral-3-14B-Agent-Diff-SFT-merged"
@@ -21,7 +22,7 @@ name = "ministral-3-agent-diff-rl"
 base_url = ["http://127.0.0.1:8010/v1"]
 
 [inference]
-gpu_memory_utilization = 0.8
+gpu_memory_utilization = 0.75
 vllm_extra = { attention_backend = "FLASH_ATTN", tokenizer_mode = "mistral", tokenizer = "mistralai/Ministral-3-14B-Instruct-2512-BF16", language_model_only = true }
 
 [inference.server]
@@ -30,7 +31,7 @@ port = 8010
 [inference.model]
 dtype = "bfloat16"
 enforce_eager = true
-max_model_len = 16384
+max_model_len = 15360
 tool_call_parser = "mistral"
 
 [trainer.optim]
@@ -40,6 +41,8 @@ weight_decay = 0.0
 [trainer.model]
 optimization_dtype = "bfloat16"
 reduce_dtype = "bfloat16"
+cp = 2
+ac = { freq = 1 }
 
 [trainer.tokenizer]
 name = "mistralai/Ministral-3-14B-Instruct-2512-BF16"
@@ -71,13 +74,13 @@ use_token_client = false
 name = "ministral-3-agent-diff"
 
 [orchestrator.sampling]
-max_tokens = 4096
+max_tokens = 2096
 temperature = 0.7
 
 [[orchestrator.env]]
 id = "hubert-marek/agent-diff-bench"
-args = { service = "slack,linear", task_horizon = 6, tool_efficiency_weight = 0.0, max_turns = 20 }
-max_retries = 30
+args = { service = "slack,linear,calendar,box", task_horizon = 6, tool_efficiency_weight = 0.0, max_turns = 20 }
+max_retries = 25
 
 [orchestrator.eval]
 interval = 10
@@ -85,6 +88,6 @@ rollouts_per_example = 2
 
 [[orchestrator.eval.env]]
 id = "hubert-marek/agent-diff-bench"
-args = { service = "slack,linear", task_horizon = 6, tool_efficiency_weight = 0.0, max_turns = 20 }
+args = { service = "slack,linear,calendar,box", task_horizon = 6, tool_efficiency_weight = 0.0, max_turns = 20 }
 num_examples = -1
-max_retries = 30
+max_retries = 25
