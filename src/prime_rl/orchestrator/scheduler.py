@@ -42,6 +42,8 @@ class GroupState:
     rollouts_to_schedule: int
     completed_rollouts: list[vf.RolloutOutput] = field(default_factory=list)
     pinned_client: vf.ClientConfig | None = None
+    reschedule_count: int = 0
+    has_forced_zero_rollout: bool = False
 
 
 class Scheduler:
@@ -94,6 +96,7 @@ class Scheduler:
         self.inference_pool = inference_pool
 
         self.max_retries_by_task = {env.resolved_name: env.max_retries for env in config.env}
+        self.max_group_reschedules_by_task = {env.resolved_name: env.max_group_reschedules for env in config.env}
         self.deferred_group_scoring_tasks = set(deferred_group_scoring_tasks or ())
         if self.deferred_group_scoring_tasks:
             task_list = ", ".join(sorted(self.deferred_group_scoring_tasks))
@@ -117,7 +120,34 @@ class Scheduler:
         self.empty_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.errored_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.total_rollouts_by_task: dict[str, int] = defaultdict(int)
+        self.dropped_groups_by_task: dict[str, int] = defaultdict(int)
+        self.forced_zero_rollouts_by_task: dict[str, int] = defaultdict(int)
+        self.forced_zero_groups_by_task: dict[str, int] = defaultdict(int)
         self.last_batch_generation_time = 0.0
+
+    @staticmethod
+    def _rollout_has_generated_tokens(rollout: vf.RolloutOutput) -> bool:
+        for step in rollout.get("trajectory", []):
+            tokens = step.get("tokens")
+            if tokens is None:
+                continue
+            if len(tokens.get("completion_ids", [])) > 0:
+                return True
+        return False
+
+    @staticmethod
+    def _force_zero_reward_rollout(rollout: vf.RolloutOutput, reason: str) -> vf.RolloutOutput:
+        forced_rollout = dict(rollout)
+        forced_rollout["reward"] = 0.0
+        forced_rollout["error"] = None
+        if forced_rollout.get("stop_condition") is None:
+            forced_rollout["stop_condition"] = "forced_zero_reward_failure"
+        forced_rollout["_prime_rl_forced_zero_reward"] = True
+        forced_rollout["_prime_rl_forced_zero_reason"] = reason
+        metrics = dict(forced_rollout.get("metrics") or {})
+        metrics["forced_zero_reward_failure"] = 1.0
+        forced_rollout["metrics"] = metrics
+        return forced_rollout
 
     @property
     def uses_token_batching(self) -> bool:
@@ -350,7 +380,11 @@ class Scheduler:
         if not self._should_defer_group_scoring(task):
             return completed_rollouts
         env_for_task = self.env.get_env_for_task(task)
-        await env_for_task.rubric.score_group(cast(list[vf.State], completed_rollouts))
+        score_targets = [
+            rollout for rollout in completed_rollouts if not rollout.get("_prime_rl_forced_zero_reward", False)
+        ]
+        if score_targets:
+            await env_for_task.rubric.score_group(cast(list[vf.State], score_targets))
         return completed_rollouts
 
     async def generate_batch(self, step: int) -> list[vf.RolloutOutput]:
@@ -421,8 +455,33 @@ class Scheduler:
                             f"{rollout['error']['error_chain_repr']}"
                         )
                     if should_reschedule:
-                        group.rollouts_to_schedule += 1
-                        continue
+                        group.reschedule_count += 1
+                        max_group_reschedules = self.max_group_reschedules_by_task.get(task, 3)
+                        if group.reschedule_count <= max_group_reschedules:
+                            group.rollouts_to_schedule += 1
+                            continue
+
+                        if self._rollout_has_generated_tokens(rollout):
+                            reason = "empty_trajectory"
+                            if rollout["error"] is not None:
+                                reason = rollout["error"]["error_chain_repr"]
+                            rollout = self._force_zero_reward_rollout(rollout, reason)
+                            self.forced_zero_rollouts_by_task[task] += 1
+                            if not group.has_forced_zero_rollout:
+                                group.has_forced_zero_rollout = True
+                                self.forced_zero_groups_by_task[task] += 1
+                            self.logger.warning(
+                                f"Rollout group {group_id} ({task}) exceeded max_group_reschedules={max_group_reschedules}. "
+                                "Converting failed rollout with generated tokens into zero-reward training example."
+                            )
+                        else:
+                            self.dropped_groups_by_task[task] += 1
+                            self.logger.warning(
+                                f"Rollout group {group_id} ({task}) exceeded max_group_reschedules={max_group_reschedules} "
+                                "without generating tokens. Dropping group."
+                            )
+                            await self.drop_group(group_id)
+                            continue
 
                     group.completed_rollouts.append(rollout)
                     if len(group.completed_rollouts) < self.rollouts_per_example:
@@ -497,6 +556,9 @@ class Scheduler:
             "scheduler/inflight_rollouts": self.inflight_rollout_count,
             "scheduler/inflight_samples": self.inflight_sample_count,
             "scheduler/cancelled_rollouts": self.cancelled_rollouts_count,
+            "scheduler/dropped_groups": sum(self.dropped_groups_by_task.values()),
+            "scheduler/forced_zero_rollouts": sum(self.forced_zero_rollouts_by_task.values()),
+            "scheduler/forced_zero_groups": sum(self.forced_zero_groups_by_task.values()),
             "empty_rollouts/all": sum(self.empty_rollouts_by_task.values()) / max(total_rollouts, 1),
             "errored_rollouts/all": sum(self.errored_rollouts_by_task.values()) / max(total_rollouts, 1),
             "off_policy_level/all/max": self.max_off_policy_level,
@@ -509,6 +571,12 @@ class Scheduler:
         for task, count in self.errored_rollouts_by_task.items():
             task_total = max(self.total_rollouts_by_task[task], 1)
             metrics[f"errored_rollouts/{task}"] = count / task_total
+        for task, count in self.dropped_groups_by_task.items():
+            metrics[f"scheduler/dropped_groups/{task}"] = count
+        for task, count in self.forced_zero_rollouts_by_task.items():
+            metrics[f"scheduler/forced_zero_rollouts/{task}"] = count
+        for task, count in self.forced_zero_groups_by_task.items():
+            metrics[f"scheduler/forced_zero_groups/{task}"] = count
         by_task: dict[str, list[int]] = {}
         for info in self.inflight_requests.values():
             by_task.setdefault(info.task, []).append(info.off_policy_steps)
@@ -520,6 +588,9 @@ class Scheduler:
         self.empty_rollouts_by_task.clear()
         self.errored_rollouts_by_task.clear()
         self.total_rollouts_by_task.clear()
+        self.dropped_groups_by_task.clear()
+        self.forced_zero_rollouts_by_task.clear()
+        self.forced_zero_groups_by_task.clear()
 
         # Add inference pool metrics (e.g. elastic pool server counts)
         metrics.update(self.inference_pool.get_metrics())

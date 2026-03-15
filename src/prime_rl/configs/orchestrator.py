@@ -294,6 +294,17 @@ class EnvConfig(BaseConfig):
             description="Maximum number of times the environment will retry a failed rollout.",
         ),
     ] = 0
+    max_group_reschedules: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Maximum number of scheduler-level re-schedules for a rollout group before it is terminally handled. "
+                "If a failed rollout in the group has generated completion tokens, the orchestrator can convert it into "
+                "a zero-reward completed rollout after this limit. Otherwise the group is dropped."
+            ),
+        ),
+    ] = 3
 
     @property
     def resolved_name(self) -> str:
