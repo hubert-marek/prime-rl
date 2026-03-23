@@ -13,7 +13,7 @@ from verifiers.workers import ZMQEnvClient, ZMQEnvServer
 from prime_rl.utils.logger import InterceptHandler, ProgressTracker
 
 DEFAULT_RETRIES = 0
-REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args", "additional"]
+REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args"]
 DEFAULT_STATE_COLUMNS = []
 
 
@@ -91,8 +91,9 @@ async def run_rollout(
 
     Asynchronously generates and scores one rollout.
     """
-    state_columns = state_columns + REQUIRED_STATE_COLUMNS
     rollout_input = vf.RolloutInput(**example)
+    task_env = env.get_env_for_task(rollout_input["task"]) if hasattr(env, "get_env_for_task") else env
+    state_columns = state_columns + REQUIRED_STATE_COLUMNS + getattr(task_env, "state_columns", [])
     return await env.run_rollout(
         rollout_input,
         client=client,
