@@ -77,6 +77,15 @@ async def wait_for_env_servers(env_clients: list[EnvClient]) -> None:
     await asyncio.gather(*[env_client.wait_for_server_startup() for env_client in env_clients])
 
 
+def _get_rollout_state_columns(
+    env: vf.Environment,
+    rollout_input: vf.RolloutInput,
+    state_columns: list[str],
+) -> list[str]:
+    task_env = env.get_env_for_task(rollout_input["task"]) if hasattr(env, "get_env_for_task") else env
+    return state_columns + REQUIRED_STATE_COLUMNS + getattr(task_env, "state_columns", [])
+
+
 async def run_rollout(
     env: vf.Environment,
     client: vf.ClientConfig,
@@ -92,8 +101,7 @@ async def run_rollout(
     Asynchronously generates and scores one rollout.
     """
     rollout_input = vf.RolloutInput(**example)
-    task_env = env.get_env_for_task(rollout_input["task"]) if hasattr(env, "get_env_for_task") else env
-    state_columns = state_columns + REQUIRED_STATE_COLUMNS + getattr(task_env, "state_columns", [])
+    state_columns = _get_rollout_state_columns(env, rollout_input, state_columns)
     return await env.run_rollout(
         rollout_input,
         client=client,
@@ -119,7 +127,8 @@ async def run_group(
 
     Asynchronously generates and scores a group.
     """
-    state_columns = state_columns + REQUIRED_STATE_COLUMNS
+    rollout_input = vf.RolloutInput(**example)
+    state_columns = _get_rollout_state_columns(env, rollout_input, state_columns)
     group_inputs = [vf.RolloutInput(**example) for _ in range(rollouts_per_example)]
     return await env.run_group(
         group_inputs,
